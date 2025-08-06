@@ -249,3 +249,25 @@ func (gc *GarbageCollector) PrintHeap() {
 		fmt.Printf("  ... and %d more objects\n", len(gc.heap)-10)
 	}
 }
+
+// testing
+// In gc.go - add these methods
+func (gc *GarbageCollector) GetHeapSize() int {
+	gc.mutex.RLock()
+	defer gc.mutex.RUnlock()
+	return len(gc.heap)
+}
+
+func (gc *GarbageCollector) GetRootCount() int {
+	gc.mutex.RLock()
+	defer gc.mutex.RUnlock()
+	return len(gc.rootSet)
+}
+
+func (obj *Object) IsObjectMarked() bool {
+	return obj.isMarked
+}
+
+func (obj *Object) GetRefs() []*Object {
+	return obj.refs
+}
