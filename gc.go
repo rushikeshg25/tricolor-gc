@@ -96,15 +96,8 @@ func (gc *GarbageCollector) Allocate(size int) *Object {
 	gc.mutex.Lock()
 	defer gc.mutex.Unlock()
 
-	if gc.freeList != nil && int(gc.freeList.size) >= size {
-		obj := gc.freeList
-		gc.freeList = obj.next
-		obj.next = nil
-		obj.color = WHITE
-		obj.isMarked = false
-		obj.data = make([]byte, size)
-		return obj
-	}
+	// Always create new objects to avoid memory corruption issues
+	// In a production GC, you'd implement a more sophisticated free list
 	obj := &Object{
 		id:    gc.objID,
 		data:  make([]byte, size),
@@ -174,6 +167,15 @@ func (gc *GarbageCollector) sweepPhase() {
 	var newHeap []*Object
 	var freedCount int
 	var freedBytes int64
+	fmt.Printf("Before sweep - Roots: %d, Heap objects: %d\n", len(gc.rootSet), len(gc.heap))
+	for i, root := range gc.rootSet {
+		if root != nil {
+			fmt.Printf("  Root[%d]: Obj[%d], marked: %v\n", i, root.id, root.isMarked)
+		}
+	}
+
+	var newRootSet []*Object
+
 	for _, obj := range gc.heap {
 		if obj.isMarked {
 			// Keep marked objects
@@ -183,9 +185,6 @@ func (gc *GarbageCollector) sweepPhase() {
 			freedCount++
 			freedBytes += int64(obj.size)
 
-			obj.next = gc.freeList
-			gc.freeList = obj
-
 			select {
 			case gc.sweepQueue <- obj:
 			default:
@@ -193,11 +192,29 @@ func (gc *GarbageCollector) sweepPhase() {
 			}
 		}
 	}
+
+	for _, root := range gc.rootSet {
+		if root != nil && root.isMarked {
+			keepRoot := false
+			for _, heapObj := range newHeap {
+				if heapObj == root {
+					keepRoot = true
+					break
+				}
+			}
+			if keepRoot {
+				newRootSet = append(newRootSet, root)
+			}
+		}
+	}
+
 	gc.heap = newHeap
+	gc.rootSet = newRootSet
 	atomic.AddInt64(&gc.totalFreed, freedBytes)
 	atomic.AddInt64(&gc.totalAlloc, -freedBytes)
 
 	fmt.Printf("Swept %d objects, freed %d bytes\n", freedCount, freedBytes)
+	fmt.Printf("Roots after sweep: %d\n", len(gc.rootSet))
 }
 
 func (gc *GarbageCollector) AddRoot(obj *Object) {
@@ -209,5 +226,26 @@ func (gc *GarbageCollector) AddRoot(obj *Object) {
 func (gc *GarbageCollector) AddReference(from, to *Object) {
 	if from != nil && to != nil {
 		from.refs = append(from.refs, to)
+	}
+}
+
+func (gc *GarbageCollector) PrintHeap() {
+	gc.mutex.RLock()
+	defer gc.mutex.RUnlock()
+
+	fmt.Println("Heap State:")
+	fmt.Printf("Objects: %d, Roots: %d\n", len(gc.heap), len(gc.rootSet))
+
+	colorNames := map[Color]string{WHITE: "White", GRAY: "Gray", BLACK: "Black"}
+
+	for i, obj := range gc.heap {
+		if i < 10 {
+			fmt.Printf("  Obj[%d]: %s, Size: %d, Refs: %d\n",
+				obj.id, colorNames[obj.color], obj.size, len(obj.refs))
+		}
+	}
+
+	if len(gc.heap) > 10 {
+		fmt.Printf("  ... and %d more objects\n", len(gc.heap)-10)
 	}
 }
