@@ -47,7 +47,7 @@ func NewGarbageCollector() *GarbageCollector {
 		objID:      0,
 		heap:       make([]*Object, 0),
 		rootSet:    make([]*Object, 0),
-		threshold:  1024 * 1024,
+		threshold:  512, //in bytes
 		markQueue:  make(chan *Object, 100),
 		sweepQueue: make(chan *Object, 100),
 	}
@@ -64,7 +64,26 @@ func (gc *GarbageCollector) concurrentMarker() {
 	}
 }
 
-func (gc *GarbageCollector) markObject(obj *Object) {}
+func (gc *GarbageCollector) markObject(obj *Object) {
+	if obj == nil || obj.color == BLACK {
+		return
+	}
+	obj.color = BLACK
+	obj.isMarked = true
+
+	for _, ref := range obj.refs {
+		if ref != nil && ref.color == WHITE {
+			ref.color = GRAY
+			gc.wg.Add(1)
+			select {
+			case gc.markQueue <- ref:
+			default:
+				gc.markObject(ref)
+				gc.wg.Done()
+			}
+		}
+	}
+}
 
 func (gc *GarbageCollector) concurrentSweeper() {
 	for obj := range gc.sweepQueue {
@@ -113,7 +132,7 @@ func (gc *GarbageCollector) TriggerGC() {
 	fmt.Printf("Started Gc at %q", start)
 
 	// Phase 1: Mark phase (tricolor marking)
-	gc.markWithTricolorPhase()
+	gc.markWithColorPhase()
 
 	// Phase 2: Sweep phase
 	gc.sweepPhase()
@@ -125,9 +144,61 @@ func (gc *GarbageCollector) TriggerGC() {
 
 }
 
-func (gc *GarbageCollector) markWithTricolorPhase() {}
+func (gc *GarbageCollector) markWithColorPhase() {
+	gc.mutex.Lock()
+	defer gc.mutex.Unlock()
 
-func (gc *GarbageCollector) sweepPhase() {}
+	for _, obj := range gc.heap {
+		obj.color = WHITE
+		obj.isMarked = false
+	}
+
+	for _, root := range gc.rootSet {
+		if root != nil {
+			root.color = GRAY
+			gc.wg.Add(1)
+			select {
+			case gc.markQueue <- root:
+			default:
+				gc.markObject(root)
+				gc.wg.Done()
+			}
+		}
+	}
+	gc.wg.Wait()
+}
+
+func (gc *GarbageCollector) sweepPhase() {
+	gc.mutex.Lock()
+	defer gc.mutex.Unlock()
+	var newHeap []*Object
+	var freedCount int
+	var freedBytes int64
+	for _, obj := range gc.heap {
+		if obj.isMarked {
+			// Keep marked objects
+			newHeap = append(newHeap, obj)
+		} else {
+			// Free unmarked objects
+			freedCount++
+			freedBytes += int64(obj.size)
+
+			obj.next = gc.freeList
+			gc.freeList = obj
+
+			select {
+			case gc.sweepQueue <- obj:
+			default:
+				gc.cleanupObject(obj)
+			}
+		}
+	}
+	gc.heap = newHeap
+	atomic.AddInt64(&gc.totalFreed, freedBytes)
+	atomic.AddInt64(&gc.totalAlloc, -freedBytes)
+
+	fmt.Printf("Swept %d objects, freed %d bytes\n", freedCount, freedBytes)
+}
 
 func (gc *GarbageCollector) AddRoot(obj *Object) {
 	gc.mutex.Lock()
