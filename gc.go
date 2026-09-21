@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -18,256 +17,176 @@ const (
 type Object struct {
 	id       int
 	data     []byte
-	isMarked bool
 	color    Color
+	isMarked bool
 	size     uintptr
-	refs     []*Object //slice of pointers to other objects
-	next     *Object
+	refs     []*Object
+	owner    *GarbageCollector
+	alive    bool
 }
-
 type GarbageCollector struct {
-	objID          int
-	heap           []*Object
-	rootSet        []*Object
-	freeList       *Object //list of available (free) memory blocks that can be reused instead of allocating new ones
-	totalAlloc     int64
-	threshold      int64
-	gcRunningState int32
-	markQueue      chan *Object
-	sweepQueue     chan *Object
-	wg             sync.WaitGroup
-	mutex          sync.RWMutex
-	gcIterations   int64
-	totalFreed     int64
-	gcTime         time.Duration
+	mutex                                sync.RWMutex
+	objID                                int
+	heap                                 []*Object
+	rootSet                              []*Object
+	totalAlloc, totalFreed, gcIterations int64
+	gcTime                               time.Duration
+	closed                               bool
 }
 
-func NewGarbageCollector() *GarbageCollector {
-	g := &GarbageCollector{
-		objID:      0,
-		heap:       make([]*Object, 0),
-		rootSet:    make([]*Object, 0),
-		threshold:  512, //in bytes
-		markQueue:  make(chan *Object, 100),
-		sweepQueue: make(chan *Object, 100),
-	}
+func NewGarbageCollector() *GarbageCollector { return &GarbageCollector{} }
 
-	go g.concurrentMarker()
-	go g.concurrentSweeper()
-	return g
-}
-
-func (gc *GarbageCollector) concurrentMarker() {
-	for obj := range gc.markQueue {
-		gc.markObject(obj)
-		gc.wg.Done()
-	}
-}
-
-func (gc *GarbageCollector) markObject(obj *Object) {
-	if obj == nil || obj.color == BLACK {
-		return
-	}
-	obj.color = BLACK
-	obj.isMarked = true
-
-	for _, ref := range obj.refs {
-		if ref != nil && ref.color == WHITE {
-			ref.color = GRAY
-			gc.wg.Add(1)
-			select {
-			case gc.markQueue <- ref:
-			default:
-				gc.markObject(ref)
-				gc.wg.Done()
-			}
-		}
-	}
-}
-
-func (gc *GarbageCollector) concurrentSweeper() {
-	for obj := range gc.sweepQueue {
-		gc.cleanupObject(obj)
-	}
-}
-func (gc *GarbageCollector) cleanupObject(obj *Object) {}
-
+// Allocate returns an unrooted object. Negative allocations and closed heaps return nil.
+// Collection is explicit, so callers can establish roots before requesting a cycle.
 func (gc *GarbageCollector) Allocate(size int) *Object {
 	gc.mutex.Lock()
 	defer gc.mutex.Unlock()
-
-	// Always create new objects to avoid memory corruption issues
-	// In a production GC, you'd implement a more sophisticated free list
-	obj := &Object{
-		id:    gc.objID,
-		data:  make([]byte, size),
-		refs:  make([]*Object, 0),
-		color: WHITE,
-		size:  uintptr(size),
+	if size < 0 || gc.closed {
+		return nil
 	}
+	o := &Object{id: gc.objID, data: make([]byte, size), size: uintptr(size), owner: gc, alive: true}
 	gc.objID++
-	gc.heap = append(gc.heap, obj)
-	atomic.AddInt64(&gc.totalAlloc, int64(size))
-
-	if atomic.LoadInt64(&gc.totalAlloc) > gc.threshold {
-		go gc.TriggerGC()
-	}
-	return obj
+	gc.heap = append(gc.heap, o)
+	gc.totalAlloc += int64(size)
+	return o
 }
-
-func (gc *GarbageCollector) TriggerGC() {
-	//Check if GC is already running
-	if !atomic.CompareAndSwapInt32(&gc.gcRunningState, 0, 1) {
+func (gc *GarbageCollector) valid(o *Object) bool {
+	return o != nil && o.owner == gc && o.alive && !gc.closed
+}
+func (gc *GarbageCollector) AddRoot(o *Object) {
+	gc.mutex.Lock()
+	defer gc.mutex.Unlock()
+	if !gc.valid(o) {
 		return
 	}
-
-	start := time.Now()
-	fmt.Printf("Started Gc at %q", start)
-
-	// Phase 1: Mark phase (tricolor marking)
-	gc.markWithColorPhase()
-
-	// Phase 2: Sweep phase
-	gc.sweepPhase()
-
-	duration := time.Since(start)
-	gc.gcTime += duration
-
-	atomic.StoreInt32(&gc.gcRunningState, 0)
-
+	for _, r := range gc.rootSet {
+		if r == o {
+			return
+		}
+	}
+	gc.rootSet = append(gc.rootSet, o)
 }
-
-func (gc *GarbageCollector) markWithColorPhase() {
+func (gc *GarbageCollector) RemoveRoot(o *Object) {
 	gc.mutex.Lock()
 	defer gc.mutex.Unlock()
-
-	for _, obj := range gc.heap {
-		obj.color = WHITE
-		obj.isMarked = false
-	}
-
-	for _, root := range gc.rootSet {
-		if root != nil {
-			root.color = GRAY
-			gc.wg.Add(1)
-			select {
-			case gc.markQueue <- root:
-			default:
-				gc.markObject(root)
-				gc.wg.Done()
-			}
+	for i, r := range gc.rootSet {
+		if r == o {
+			gc.rootSet = append(gc.rootSet[:i], gc.rootSet[i+1:]...)
+			return
 		}
 	}
-	gc.wg.Wait()
 }
-
-func (gc *GarbageCollector) sweepPhase() {
-	gc.mutex.Lock()
-	defer gc.mutex.Unlock()
-	var newHeap []*Object
-	var freedCount int
-	var freedBytes int64
-	fmt.Printf("Before sweep - Roots: %d, Heap objects: %d\n", len(gc.rootSet), len(gc.heap))
-	for i, root := range gc.rootSet {
-		if root != nil {
-			fmt.Printf("  Root[%d]: Obj[%d], marked: %v\n", i, root.id, root.isMarked)
-		}
-	}
-
-	var newRootSet []*Object
-
-	for _, obj := range gc.heap {
-		if obj.isMarked {
-			// Keep marked objects
-			newHeap = append(newHeap, obj)
-		} else {
-			// Free unmarked objects
-			freedCount++
-			freedBytes += int64(obj.size)
-
-			select {
-			case gc.sweepQueue <- obj:
-			default:
-				gc.cleanupObject(obj)
-			}
-		}
-	}
-
-	for _, root := range gc.rootSet {
-		if root != nil && root.isMarked {
-			keepRoot := false
-			for _, heapObj := range newHeap {
-				if heapObj == root {
-					keepRoot = true
-					break
-				}
-			}
-			if keepRoot {
-				newRootSet = append(newRootSet, root)
-			}
-		}
-	}
-
-	gc.heap = newHeap
-	gc.rootSet = newRootSet
-	atomic.AddInt64(&gc.totalFreed, freedBytes)
-	atomic.AddInt64(&gc.totalAlloc, -freedBytes)
-
-	fmt.Printf("Swept %d objects, freed %d bytes\n", freedCount, freedBytes)
-	fmt.Printf("Roots after sweep: %d\n", len(gc.rootSet))
-}
-
-func (gc *GarbageCollector) AddRoot(obj *Object) {
-	gc.mutex.Lock()
-	defer gc.mutex.Unlock()
-	gc.rootSet = append(gc.rootSet, obj)
-}
-
 func (gc *GarbageCollector) AddReference(from, to *Object) {
-	if from != nil && to != nil {
+	gc.mutex.Lock()
+	defer gc.mutex.Unlock()
+	if gc.valid(from) && gc.valid(to) {
 		from.refs = append(from.refs, to)
 	}
 }
-
-func (gc *GarbageCollector) PrintHeap() {
-	gc.mutex.RLock()
-	defer gc.mutex.RUnlock()
-
-	fmt.Println("Heap State:")
-	fmt.Printf("Objects: %d, Roots: %d\n", len(gc.heap), len(gc.rootSet))
-
-	colorNames := map[Color]string{WHITE: "White", GRAY: "Gray", BLACK: "Black"}
-
-	for i, obj := range gc.heap {
-		if i < 10 {
-			fmt.Printf("  Obj[%d]: %s, Size: %d, Refs: %d\n",
-				obj.id, colorNames[obj.color], obj.size, len(obj.refs))
+func (gc *GarbageCollector) RemoveReference(from, to *Object) {
+	gc.mutex.Lock()
+	defer gc.mutex.Unlock()
+	if !gc.valid(from) {
+		return
+	}
+	refs := from.refs[:0]
+	for _, r := range from.refs {
+		if r != to {
+			refs = append(refs, r)
 		}
 	}
-
-	if len(gc.heap) > 10 {
-		fmt.Printf("  ... and %d more objects\n", len(gc.heap)-10)
-	}
+	from.refs = refs
 }
 
-// testing
-// In gc.go - add these methods
+// TriggerGC runs a complete stop-the-world cycle under the heap lock.
+func (gc *GarbageCollector) TriggerGC() {
+	gc.mutex.Lock()
+	defer gc.mutex.Unlock()
+	if gc.closed {
+		return
+	}
+	start := time.Now()
+	for _, o := range gc.heap {
+		o.color = WHITE
+		o.isMarked = false
+	}
+	queue := append([]*Object(nil), gc.rootSet...)
+	for _, r := range queue {
+		r.color = GRAY
+	}
+	for len(queue) > 0 {
+		o := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		if o.color == BLACK {
+			continue
+		}
+		for _, r := range o.refs {
+			if r.alive && r.color == WHITE {
+				r.color = GRAY
+				queue = append(queue, r)
+			}
+		}
+		o.color = BLACK
+		o.isMarked = true
+	}
+	live := make([]*Object, 0, len(gc.heap))
+	for _, o := range gc.heap {
+		if o.isMarked {
+			live = append(live, o)
+		} else {
+			gc.totalFreed += int64(o.size)
+			gc.totalAlloc -= int64(o.size)
+			gc.cleanupObject(o)
+		}
+	}
+	gc.heap = live
+	gc.gcIterations++
+	gc.gcTime += time.Since(start)
+}
+func (gc *GarbageCollector) cleanupObject(o *Object) { o.data = nil; o.refs = nil; o.alive = false }
+func (gc *GarbageCollector) Close() {
+	gc.mutex.Lock()
+	defer gc.mutex.Unlock()
+	if gc.closed {
+		return
+	}
+	for _, o := range gc.heap {
+		gc.cleanupObject(o)
+	}
+	gc.totalFreed += gc.totalAlloc
+	gc.totalAlloc = 0
+	gc.heap = nil
+	gc.rootSet = nil
+	gc.closed = true
+}
 func (gc *GarbageCollector) GetHeapSize() int {
 	gc.mutex.RLock()
 	defer gc.mutex.RUnlock()
 	return len(gc.heap)
 }
-
 func (gc *GarbageCollector) GetRootCount() int {
 	gc.mutex.RLock()
 	defer gc.mutex.RUnlock()
 	return len(gc.rootSet)
 }
-
-func (obj *Object) IsObjectMarked() bool {
-	return obj.isMarked
+func (o *Object) IsObjectMarked() bool {
+	if o == nil {
+		return false
+	}
+	o.owner.mutex.RLock()
+	defer o.owner.mutex.RUnlock()
+	return o.isMarked && o.alive
 }
-
-func (obj *Object) GetRefs() []*Object {
-	return obj.refs
+func (o *Object) GetRefs() []*Object {
+	if o == nil {
+		return nil
+	}
+	o.owner.mutex.RLock()
+	defer o.owner.mutex.RUnlock()
+	return append([]*Object(nil), o.refs...)
+}
+func (gc *GarbageCollector) PrintHeap() {
+	gc.mutex.RLock()
+	defer gc.mutex.RUnlock()
+	fmt.Printf("Objects: %d, roots: %d, live bytes: %d, freed bytes: %d\n", len(gc.heap), len(gc.rootSet), gc.totalAlloc, gc.totalFreed)
 }
